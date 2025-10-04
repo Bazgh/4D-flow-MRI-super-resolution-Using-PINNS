@@ -19,7 +19,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset, RandomSampler
 import pandas
-from stl import mesh
+import glob
+
 
 import matplotlib
 
@@ -37,11 +38,12 @@ import pandas as pd
 # ----------------------------
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CKPT_PATH = os.path.join(ROOT, "geom_pointnet_vae_k8_N400.pt")
-CKPT_PATH2 = os.path.join(ROOT, "inlet_pointnet_vae_k4_N400.pt")
+CKPT_PATH2 = os.path.join(ROOT, "inlet_pointnet_vae_knew8_N4000.pt")
+CKPT_PATH2 = os.path.join(ROOT, "sparse_pointnet_vae_k8_N4000.pt")
 MESH_FILE = os.path.join(ROOT, "vel.csv")
 INLET_FILE = os.path.join(ROOT, "inlet_vel.csv")
 WALL_FILE = os.path.join(ROOT, "wall.csv")
-SPARSE_FILE = os.path.join(ROOT, "sample_2.vtk")
+SPARSE_FILE = os.path.join(ROOT, "npz_sparse")
 RESULT_DIR = os.path.join(ROOT, "Results")
 os.makedirs(RESULT_DIR, exist_ok=True)
 
@@ -133,6 +135,20 @@ w_inlet = inlet_uvw[:, 2:3]
 Inlet_vector = np.concatenate((inlet_xyz, inlet_uvw), axis=1)
 print(Inlet_vector.shape)
 
+print("loading sparse data:",SPARSE_FILE,flush=True)
+input_dir="npz_sparse"
+for f in glob.glob(os.path.join(input_dir, "*.npz")):
+    data = np.load(f)
+    arr = data[data.files[0]]  # first array
+
+print("Loaded shape:", arr.shape)   # should be (N,6)
+
+# Split into xyz and uvw
+sparse_xyz = arr[:, :3].astype(np.float32)
+sparse_uvw = arr[:, 3:6].astype(np.float32)
+Sparse_vector = np.concatenate((inlet_xyz, inlet_uvw), axis=1)
+print("Final shape:", Sparse_vector.shape)
+
 print("Loading wall:", WALL_FILE, flush=True)
 csv_wall = pandas.read_csv(WALL_FILE)
 wall_xyz = csv_wall.iloc[:, : 3].to_numpy().astype(np.float32)
@@ -157,7 +173,8 @@ w_wall_BC = np.zeros_like(zb, dtype=np.float32)
 # Geometry encoder  & Inlet encoder (latent z)
 # ----------------------------
 from Geometry_encoder_training import BoundaryEncoder
-from Inlet_encoder_training import InletEncoder
+from Inlet_encoder_flowrate import InletEncoder
+from sparse_data_encoder import InletEncoder
 
 
 def load_geom_encoder_and_latent(wall_to_compress: np.ndarray, k: int) -> torch.Tensor:
@@ -194,10 +211,12 @@ def load_inlet_encoder_and_latent(inlet_to_compress: np.ndarray, k: int) -> torc
 
 # Instantiate with the *checkpoint's* k
 geom_latent = load_geom_encoder_and_latent(wall_xyz, k=8).to(device)  # [K1]
-inlet_latent = load_inlet_encoder_and_latent(Inlet_vector, k=4).to(device)  # [K2]
+inlet_latent = load_inlet_encoder_and_latent(Inlet_vector, k=8).to(device)  # [K2]
+sparse_latent = load_inlet_encoder_and_latent(Sparse_vector, k=8).to(device)  # [K2]
 K1 = geom_latent.numel()
 K2 = inlet_latent.numel()
-input_n = 32 + K1 + K2
+k3=sparse_latent.numel()
+input_n = 32 + K1 + K2 + k3
 
 
 # Nets
@@ -224,7 +243,7 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.main(x)
 
-#first apply MLP in Internal mesh to bring it closer to the Geometry and Inlet latent space
+#first apply MLP in Internal mesh to bring it closer to the Geometry and Inlet and sparse latent space
 input_coords=3
 h=96 #width
 depth_main_net=8
@@ -301,14 +320,14 @@ class Net2_p(nn.Module):
 # ----------------------------
 # Losses (GPU)
 # ----------------------------
-def criterion_pde(net_u, net_v, net_w, net_p,net_internal_mesh, x, y, z, geom_k, inlet_k):
+def criterion_pde(net_u, net_v, net_w, net_p,net_internal_mesh, x, y, z, geom_k, inlet_k,sparse_k):
     # x,y,z,geom_k,inlet_k are small batch tensors on GPU
     x.requires_grad_(True);
     y.requires_grad_(True);
     z.requires_grad_(True)
     net_internal_mesh_in = torch.cat((x, y, z), 1)
     mesh_latent=net_internal_mesh(net_internal_mesh_in)
-    net_in = torch.cat((mesh_latent, geom_k, inlet_k), 1)
+    net_in = torch.cat((mesh_latent, geom_k, inlet_k,sparse_k), 1)
 
     u = net_u(net_in).view(-1, 1)
     v = net_v(net_in).view(-1, 1)
@@ -382,16 +401,16 @@ def criterion_pde(net_u, net_v, net_w, net_p,net_internal_mesh, x, y, z, geom_k,
 def loss_bc(net_u, net_v, net_w,Net_internal_mesh,
             xb, yb, zb, ub, vb, wb,
             xb_in, yb_in, zb_in, ub_in, vb_in, wb_in,
-            geom_wall, geom_in, Inlet_wall, Inlet_in):
+            geom_wall, geom_in, Inlet_wall, Inlet_in,Sparse_wall,Sparse_in):
     nin_wall_ = torch.cat((xb, yb, zb), 1)
     mesh_latent_ = Net_internal_mesh(nin_wall_)
-    nin_wall = torch.cat((mesh_latent_, geom_wall, Inlet_wall), 1)
+    nin_wall = torch.cat((mesh_latent_, geom_wall, Inlet_wall,Sparse_wall), 1)
     uw = net_u(nin_wall);
     vw = net_v(nin_wall);
     ww = net_w(nin_wall)
     nin_in_ = torch.cat((xb_in, yb_in, zb_in), 1)
     mesh_latent_in = Net_internal_mesh(nin_in_ )
-    nin_in = torch.cat((mesh_latent_in , geom_in, Inlet_in), 1)
+    nin_in = torch.cat((mesh_latent_in , geom_in, Inlet_in,Sparse_in), 1)
     ui = net_u(nin_in);
     vi = net_v(nin_in);
     wi = net_w(nin_in)
@@ -409,11 +428,11 @@ def loss_bc(net_u, net_v, net_w,Net_internal_mesh,
 
 def loss_data(net_u, net_v, net_w,Net_internal_mesh,
               x_data, y_data, z_data, u_data, v_data, w_data,
-              geom_k, inlet_k
+              geom_k, inlet_k,sparse_k
               ):
     nin_data_ = torch.cat((x_data, y_data, z_data), 1)
     data_latent = Net_internal_mesh(nin_data_)
-    nin_data = torch.cat((data_latent, geom_k, inlet_k), 1)
+    nin_data = torch.cat((data_latent, geom_k, inlet_k,sparse_k), 1)
     u_prediction = net_u(nin_data);
     v_prediction = net_v(nin_data);
     w_prediction = net_w(nin_data);
@@ -504,6 +523,7 @@ def train():
             z_in = z_in_cpu.to(device, non_blocking=True)
             geomN = geom_latent.view(1, -1).to(device).expand(x_in.shape[0], -1)
             inletN = inlet_latent.view(1, -1).to(device).expand(x_in.shape[0], -1)
+            sparseN = sparse_latent.view(1, -1).to(device).expand(x_in.shape[0], -1)
 
             opt_u.zero_grad();
             opt_v.zero_grad();
@@ -513,22 +533,25 @@ def train():
             with autocast(enabled=use_amp):
                 # PDE on collocation batch
                 leq = criterion_pde(net_u, net_v, net_w, net_p,net_internal_mesh, x_in.float(), y_in.float(), z_in.float(), geomN.float(),
-                                    inletN.float())
+                                    inletN.float(),sparseN.float())
 
                 # BC on small sets (GPU)
                 gW = geom_latent.view(1, -1).to(device).expand(xb_t.size(0), -1)
                 gI = geom_latent.view(1, -1).to(device).expand(xbi_t.size(0), -1)
                 inW = inlet_latent.view(1, -1).to(device).expand(xb_t.size(0), -1)
                 inI = inlet_latent.view(1, -1).to(device).expand(xbi_t.size(0), -1)
+                sW = sparse_latent.view(1, -1).to(device).expand(xb_t.size(0), -1)
+                sI = sparse_latent.view(1, -1).to(device).expand(xbi_t.size(0), -1)
                 lbc = loss_bc(net_u, net_v, net_w,net_internal_mesh,
                               xb_t, yb_t, zb_t, ub_t, vb_t, wb_t,
                               xbi_t, ybi_t, zbi_t, ubi_t, vbi_t, wbi_t,
-                              gW, gI, inW, inI)
+                              gW, gI, inW, inI,sW,sI)
 
                 gdata = geom_latent.view(1, -1).to(device).expand(xdata_t.size(0), -1)
                 indata = inlet_latent.view(1, -1).to(device).expand(xdata_t.size(0), -1)
+                sdata=sparse_latent.view(1, -1).to(device).expand(xdata_t.size(0), -1)
                 ldata = loss_data(net_u, net_v, net_w,net_internal_mesh, xdata_t, ydata_t, zdata_t, udata_t, vdata_t, wdata_t, gdata,
-                                  indata)
+                                  indata,sdata)
 
         loss = leq + Lambda_BC * lbc + ldata
         scaler.scale(loss).backward()
@@ -566,6 +589,7 @@ def train():
             B = 50000  # tune if needed
             g1 = geom_latent.view(1, -1).to(device)
             i1 = inlet_latent.view(1, -1).to(device)
+            s1=  sparse_latent.view(1, -1).to(device)
 
             with torch.no_grad(), torch.cuda.amp.autocast(enabled=True):
                 for s in range(0, N, B):
@@ -573,17 +597,19 @@ def train():
                     xi = torch.from_numpy(x[s:e]).float().to(device)  # x,y,z are numpy arrays of shape (N,1)
                     yi = torch.from_numpy(y[s:e]).float().to(device)
                     zi = torch.from_numpy(z[s:e]).float().to(device)
-                    coords_i = torch.cat((xb, yb, zb), 1)
+                    coords_i = torch.cat((xi, yi, zi), 1)
                     coord_latent_ = Net_internal_mesh(coords_i)
 
                     gi = g1.expand(e - s, -1)
                     ii = i1.expand(e - s, -1)
-                    nin = torch.cat((coord_latent_, gi, ii), dim=1)
+                    si=s1.expand(e - s, -1)
+                    nin = torch.cat((coord_latent_, gi, ii,si), dim=1)
                     u_pred[s:e] = net_u(nin).float().cpu().numpy()
                     v_pred[s:e] = net_v(nin).float().cpu().numpy()
                     w_pred[s:e] = net_w(nin).float().cpu().numpy()
 
             # QUICK SCATTER PNGs
+            """
             def save_scatter(vals, name):
                 fig = plt.figure(figsize=(6, 5))
                 ax = fig.add_subplot(111, projection='3d')
@@ -598,7 +624,7 @@ def train():
             save_scatter(v_pred, f"v_pred_{ep}")
             save_scatter(w_pred, f"w_pred_{ep}")
             print("Saved figures in", RESULT_DIR, flush=True)
-
+            """
             # WRITE A VTK FILE FROM CSV POINTS (PolyData .vtp)
             points = vtk.vtkPoints()
             points.SetNumberOfPoints(N)
