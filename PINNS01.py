@@ -39,7 +39,7 @@ import pandas as pd
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CKPT_PATH = os.path.join(ROOT, "geom_pointnet_vae_k8_N400.pt")
 CKPT_PATH2 = os.path.join(ROOT, "inlet_pointnet_vae_knew8_N4000.pt")
-CKPT_PATH2 = os.path.join(ROOT, "sparse_pointnet_vae_k8_N4000.pt")
+CKPT_PATH3 = os.path.join(ROOT, "sparse_pointnet_vae_k8_N4000.pt")
 MESH_FILE = os.path.join(ROOT, "vel.csv")
 INLET_FILE = os.path.join(ROOT, "inlet_vel.csv")
 WALL_FILE = os.path.join(ROOT, "wall.csv")
@@ -207,12 +207,27 @@ def load_inlet_encoder_and_latent(inlet_to_compress: np.ndarray, k: int) -> torc
         mu, lv = enc(coords_t)  # [1,k], [1,k]
         z = mu + torch.exp(0.5 * lv) * torch.randn_like(mu)
     return z.squeeze(0)  # [k]
+def load_sparse_encoder_and_latent(sparse_to_compress: np.ndarray, k: int) -> torch.Tensor:
+    enc = InletEncoder(k=k).to(device)
+    ckpt = torch.load(CKPT_PATH3, map_location=device)
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        ckpt = ckpt["model_state_dict"]
+    if isinstance(ckpt, dict):
+        enc_state = {kk.replace("enc.", "", 1): vv for kk, vv in ckpt.items() if kk.startswith("enc.")}
+        enc.load_state_dict(enc_state if enc_state else ckpt, strict=True)
+    enc.eval()
+    with torch.no_grad():
+        coords_t = torch.from_numpy(sparse_to_compress).unsqueeze(0).to(device)  # [1,N,6]
+        mu, lv = enc(coords_t)  # [1,k], [1,k]
+        z = mu + torch.exp(0.5 * lv) * torch.randn_like(mu)
+    return z.squeeze(0)  # [k]
+
 
 
 # Instantiate with the *checkpoint's* k
 geom_latent = load_geom_encoder_and_latent(wall_xyz, k=8).to(device)  # [K1]
 inlet_latent = load_inlet_encoder_and_latent(Inlet_vector, k=8).to(device)  # [K2]
-sparse_latent = load_inlet_encoder_and_latent(Sparse_vector, k=8).to(device)  # [K2]
+sparse_latent = load_sparse_encoder_and_latent(Sparse_vector, k=8).to(device)  # [K2]
 K1 = geom_latent.numel()
 K2 = inlet_latent.numel()
 k3=sparse_latent.numel()
