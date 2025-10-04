@@ -1,5 +1,5 @@
 Description:
-PINNS02.py is our main code.
+PINNS01.py is our main code.
  In our current Implementation, we are trying to incorporate Geometry latent representatoin and Inelt information (Geometry and velocity profile) to Amir CardioLab code. Please see His original code in Amir method.py file.
 
 
